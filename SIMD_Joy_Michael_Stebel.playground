@@ -1,0 +1,138 @@
+//: # The Joy of SIMD (Swift)
+//:
+//: **Author:** Michael Stebel, 12/17/25
+//:
+//: This playground demonstrates:
+//: 1) `SIMD2<Double>` as a clean container for complex arithmetic
+//: 2) True data-parallel SIMD by batching 4 complex points with `SIMD4<Double>`
+//:
+//: Run top-to-bottom, then tweak `testPoints`, `maxIter`, and `escapeRadius2`.
+//:
+import Foundation
+import simd
+
+// MARK: - Complex arithmetic with SIMD2<Double>
+
+/// Treat SIMD2<Double> as a complex number: (x = real, y = imaginary)
+typealias Complex = SIMD2<Double>
+
+@inline(__always)
+func iterate(z: Complex, c: Complex) -> Complex {
+    // z' = z^2 + c
+    // If z = (x, y), then z^2 = (x^2 - y^2, 2xy)
+    let x = z.x * z.x - z.y * z.y + c.x
+    let y = 2.0 * z.x * z.y + c.y
+    return Complex(x, y)
+}
+
+@inline(__always)
+func magnitude2(_ z: Complex) -> Double {
+    // |z|^2 = x^2 + y^2
+    return z.x * z.x + z.y * z.y
+}
+
+// MARK: - Scalar escape-time (one point)
+
+func mandelbrotEscapeIterationsScalar(
+    c: Complex,
+    maxIter: Int = 400,
+    escapeRadius2: Double = 4.0
+) -> Int {
+    var z = Complex(0.0, 0.0)
+    for i in 0..<maxIter {
+        z = iterate(z: z, c: c)
+        if magnitude2(z) > escapeRadius2 { return i }
+    }
+    return maxIter
+}
+
+// MARK: - SIMD4 batching (four points at once)
+
+@inline(__always)
+func iterate4(
+    zx: SIMD4<Double>, zy: SIMD4<Double>,
+    cx: SIMD4<Double>, cy: SIMD4<Double>
+) -> (SIMD4<Double>, SIMD4<Double>) {
+    let newX = zx * zx - zy * zy + cx
+    let newY = 2.0 * zx * zy + cy
+    return (newX, newY)
+}
+
+@inline(__always)
+func mag2_4(zx: SIMD4<Double>, zy: SIMD4<Double>) -> SIMD4<Double> {
+    zx * zx + zy * zy
+}
+
+/// Returns 4 escape iteration counts (one per lane).
+func mandelbrotEscapeIterationsSIMD4(
+    cx: SIMD4<Double>,
+    cy: SIMD4<Double>,
+    maxIter: Int = 400,
+    escapeRadius2: Double = 4.0
+) -> SIMD4<Int32> {
+    var zx = SIMD4<Double>(repeating: 0.0)
+    var zy = SIMD4<Double>(repeating: 0.0)
+
+    var escapedAt = SIMD4<Int32>(repeating: Int32(maxIter))
+    var alive = [Bool](repeating: true, count: 4)
+
+    let escape = SIMD4<Double>(repeating: escapeRadius2)
+
+    for i in 0..<maxIter {
+        // Compute the next iteration for all 4 lanes.
+        let (nx, ny) = iterate4(zx: zx, zy: zy, cx: cx, cy: cy)
+
+        // Commit results only for lanes that are still alive.
+        for lane in 0..<4 {
+            if alive[lane] {
+                zx[lane] = nx[lane]
+                zy[lane] = ny[lane]
+            }
+        }
+
+        // Escape test (still computed SIMD-wide).
+        let m2 = mag2_4(zx: zx, zy: zy)
+        let escapedNow = m2 .> escape
+
+        // Record first escape per lane.
+        for lane in 0..<4 {
+            if alive[lane] && escapedNow[lane] {
+                escapedAt[lane] = Int32(i)
+                alive[lane] = false
+            }
+        }
+
+        // Early-out if all lanes have escaped.
+        if !alive[0] && !alive[1] && !alive[2] && !alive[3] {
+            break
+        }
+    }
+
+    return escapedAt
+}
+
+// MARK: - Demo
+
+let testPoints: [Complex] = [
+    Complex(-0.75, 0.10),
+    Complex(-0.10, 0.65),
+    Complex(-0.743643887037151, 0.13182590420533),
+    Complex(0.30, 0.50)
+]
+
+let maxIter = 800
+let escapeRadius2 = 4.0
+
+print("Scalar (one point at a time):")
+for p in testPoints {
+    let it = mandelbrotEscapeIterationsScalar(c: p, maxIter: maxIter, escapeRadius2: escapeRadius2)
+    print("  c=(\(p.x), \(p.y)) -> iter=\(it)")
+}
+
+let cx = SIMD4<Double>(testPoints[0].x, testPoints[1].x, testPoints[2].x, testPoints[3].x)
+let cy = SIMD4<Double>(testPoints[0].y, testPoints[1].y, testPoints[2].y, testPoints[3].y)
+
+let it4 = mandelbrotEscapeIterationsSIMD4(cx: cx, cy: cy, maxIter: maxIter, escapeRadius2: escapeRadius2)
+
+print("\nSIMD4 (four points in parallel):")
+print("  lanes -> \(it4)")
